@@ -1,0 +1,6 @@
+/target/
+/output/
+*.o
+
+__pycache__/
+*.pyc
