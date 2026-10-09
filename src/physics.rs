@@ -80,6 +80,19 @@ pub fn hll_at(left: Q, right: Q, al: Atmos, ar: Atmos, n: V, fraction: f64) -> Q
     if left == base(al) && right == base(ar) {
         return [0.; 7];
     }
+    let (l, r, af) = face_states(left, right, al, ar, fraction);
+    let (pl, cl) = thermo(l, af);
+    let (pr, cr) = thermo(r, af);
+    assert!(pl > 0. && pr > 0.);
+    let ul = dot([l[1], l[2], l[3]], n) / l[0];
+    let ur = dot([r[1], r[2], r[3]], n) / r[0];
+    let sl = 0f64.min(ul - cl).min(ur - cr);
+    let sr = 0f64.max(ul + cl).max(ur + cr);
+    let fl = flux(l, af, n);
+    let fr = flux(r, af, n);
+    std::array::from_fn(|f| (sr * fl[f] - sl * fr[f] + sl * sr * (r[f] - l[f])) / (sr - sl))
+}
+pub fn face_states(left: Q, right: Q, al: Atmos, ar: Atmos, fraction: f64) -> (Q, Q, Atmos) {
     let mut af = Atmos {
         rho: (al.rho * ar.rho).sqrt(),
         p: (al.p * ar.p).sqrt(),
@@ -108,16 +121,7 @@ pub fn hll_at(left: Q, right: Q, al: Atmos, ar: Atmos, n: V, fraction: f64) -> Q
     } else {
         conserved(primitive(right, ar), af)
     };
-    let (pl, cl) = thermo(l, af);
-    let (pr, cr) = thermo(r, af);
-    assert!(pl > 0. && pr > 0.);
-    let ul = dot([l[1], l[2], l[3]], n) / l[0];
-    let ur = dot([r[1], r[2], r[3]], n) / r[0];
-    let sl = 0f64.min(ul - cl).min(ur - cr);
-    let sr = 0f64.max(ul + cl).max(ur + cr);
-    let fl = flux(l, af, n);
-    let fr = flux(r, af, n);
-    std::array::from_fn(|f| (sr * fl[f] - sl * fr[f] + sl * sr * (r[f] - l[f])) / (sr - sl))
+    (l, r, af)
 }
 pub fn mc(l: f64, r: f64) -> f64 {
     if l * r <= 0. {
