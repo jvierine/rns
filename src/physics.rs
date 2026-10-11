@@ -23,6 +23,12 @@ pub fn thermo(q: Q, a: Atmos) -> (f64, f64) {
     let p = (q[4] - kin) * gas / cv;
     (p, ((1. + gas / cv) * p / q[0]).sqrt())
 }
+/// Mixture internal energy per heat capacity; never clips the evolved state.
+pub fn temperature(q: Q, a: Atmos) -> f64 {
+    let cv=(q[0]-q[5]-q[6])*a.cv+q[5]*3.*RCH+q[6]*2.5*RO2;
+    let kinetic=(q[1]*q[1]+q[2]*q[2]+q[3]*q[3])/(2.*q[0]);
+    (q[4]-kinetic)/cv
+}
 pub fn primitive(q: Q, a: Atmos) -> Q {
     [
         q[0] / a.rho,

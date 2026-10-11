@@ -1,6 +1,6 @@
 //! Implicit Newtonian deviatoric stress and Fourier conduction on actual prisms.
 //! A least-squares Cartesian gradient and its exact volume adjoint form an SPD
-//! operator. This is an unstructured discretization, not a copied lat/lon stencil.
+//! operator, with affine-exact face-jump stabilization against checkerboard modes.
 use crate::{
     mesh::*,
     parallel::{Domain, ExchangeWorkspace},
@@ -10,6 +10,12 @@ use crate::{
 use anyhow::{Result, ensure};
 use mpi::{collective::SystemOperation, traits::*};
 use std::collections::BTreeSet;
+#[derive(Clone)]
+struct Penalty {
+    entries: Vec<(usize,f64)>,
+    weight: f64,
+    layer: usize,
+}
 #[derive(Clone)]
 struct Quadrature {
     index: usize,
@@ -78,6 +84,10 @@ fn mv(a: [[f64; 3]; 3], v: V) -> V {
 }
 pub struct Transport {
     quad: Vec<Quadrature>,
+    penalties: Vec<Penalty>,
+    incidence: Vec<Vec<(usize,V)>>,
+    owned: Vec<bool>,
+    threads: usize,
     pub mu: Vec<f64>,
     pub kappa: Vec<f64>,
     pub t0: Vec<f64>,
@@ -178,9 +188,32 @@ impl Transport {
                 });
             }
         }
+        // Penalize only the jump unexplained by the reconstructed gradient.
+        // This vanishes for affine fields and closes the centered-gradient
+        // checkerboard null space. The exact adjoint preserves SPD and budgets.
+        let mut penalties=vec![];
+        for q in &quad {
+            let column=d.needed[q.index/nz];
+            let position=mul(m.mesh.cells[column].center,RE+m.vertical.centers[q.layer]);
+            for &(j,_) in &q.pairs {
+                let jc=d.needed[j/nz];
+                let delta=sub(mul(m.mesh.cells[jc].center,RE+m.vertical.centers[j%nz]),position);
+                let mut coeff=std::collections::BTreeMap::<usize,f64>::new();
+                *coeff.entry(j).or_default()+=1.;
+                *coeff.entry(q.index).or_default()-=1.;
+                for &(n,c) in &q.pairs {let b=dot(c,delta);*coeff.entry(n).or_default()-=b;*coeff.entry(q.index).or_default()+=b;}
+                penalties.push(Penalty{entries:coeff.into_iter().filter(|(_,b)|b.abs()>1e-15).collect(),weight:q.volume/(2.*dot(delta,delta)),layer:q.layer});
+            }
+        }
         let len = d.needed.len() * nz;
+        let mut incidence=vec![vec![];len];
+        for (slot,q) in quad.iter().enumerate(){for &(n,c) in &q.pairs{incidence[q.index].push((slot,mul(c,-q.volume)));incidence[n].push((slot,mul(c,q.volume)));}}
+        let owned=(0..len).map(|n|d.owned.binary_search(&d.needed[n/nz]).is_ok()).collect();
+        let threads=std::env::var("RNS_TRANSPORT_THREADS").ok().and_then(|s|s.parse::<usize>().ok()).unwrap_or_else(||if d.size==1 {std::thread::available_parallelism().map(|n|n.get().min(8)).unwrap_or(1)}else{1}).max(1);
         Ok(Self {
             quad,
+            penalties,
+            incidence,owned,threads,
             mu,
             kappa,
             t0,
@@ -197,9 +230,7 @@ impl Transport {
         })
     }
     fn stresses(&self, v: &[Q], thermal: bool) -> Vec<[[f64; 3]; 3]> {
-        self.quad
-            .iter()
-            .map(|q| {
+        let calculate=|q:&Quadrature| {
                 let mut g = [[0.; 3]; 3];
                 for &(n, c) in &q.pairs {
                     for a in 0..if thermal { 1 } else { 3 } {
@@ -221,9 +252,15 @@ impl Transport {
                         })
                     })
                 }
-            })
-            .collect()
+        };
+        let mut result=vec![[[0.;3];3];self.quad.len()];
+        if self.threads>1 && self.quad.len()>100_000 {
+            let chunk=self.quad.len().div_ceil(self.threads);
+            std::thread::scope(|scope|{for (out,quad) in result.chunks_mut(chunk).zip(self.quad.chunks(chunk)){let calc=&calculate;scope.spawn(move ||{for (out,q) in out.iter_mut().zip(quad){*out=calc(q);}});}});
+        }else{for (out,q) in result.iter_mut().zip(&self.quad){*out=calculate(q);}}
+        result
     }
+
     fn apply(
         &mut self,
         m: &Model,
@@ -247,22 +284,18 @@ impl Transport {
         d.exchange_cached(w, &mut self.halo, nz, &mut self.exchange);
         let stresses = self.stresses(&self.halo, thermal);
         let mut result = x.to_vec();
-        for (q, s) in self.quad.iter().zip(stresses) {
-            for &(n, c) in &q.pairs {
-                let force = if thermal {
-                    [dot(s[0], c), 0., 0.]
-                } else {
-                    mv(s, c)
-                };
-                for (idx, sign) in [(q.index, -1.), (n, 1.)] {
-                    let col = d.needed[idx / nz];
-                    if d.owned.binary_search(&col).is_ok() {
-                        for a in 0..nc {
-                            result[idx][a] += dt * sign * q.volume * force[a] / self.root[idx];
-                        }
-                    }
-                }
-            }
+        let calculate=|n:usize,out:&mut Q| {
+            if !self.owned[n]{return;}
+            for &(slot,c) in &self.incidence[n]{let s=stresses[slot];let force=if thermal{[dot(s[0],c),0.,0.]}else{mv(s,c)};for a in 0..nc{out[a]+=dt*force[a]/self.root[n];}}
+        };
+        if self.threads>1 && result.len()>100_000 {
+            let chunk=result.len().div_ceil(self.threads);
+            std::thread::scope(|scope|{for (slot,out) in result.chunks_mut(chunk).enumerate(){let calc=&calculate;scope.spawn(move ||{for (j,q) in out.iter_mut().enumerate(){calc(slot*chunk+j,q);}});}});
+        }else{for (n,out) in result.iter_mut().enumerate(){calculate(n,out);}}
+        for p in &self.penalties {
+            let coefficient=p.weight*if thermal{self.kappa[p.layer]}else{self.mu[p.layer]};
+            let residual:V=std::array::from_fn(|a|if a<nc{p.entries.iter().map(|&(n,b)|b*self.halo[n][a]).sum()}else{0.});
+            for &(n,b) in &p.entries {if self.owned[n]{for a in 0..nc{result[n][a]+=dt*coefficient*b*residual[a]/self.root[n];}}}
         }
         result
     }
@@ -313,6 +346,7 @@ impl Transport {
             self.diag[q.index] += dt * q.volume * scale * dot(center, center)
                 / (self.root[q.index] * self.root[q.index]);
         }
+        for p in &self.penalties {let coefficient=p.weight*if thermal{self.kappa[p.layer]}else{self.mu[p.layer]};for &(n,b) in &p.entries{self.diag[n]+=dt*coefficient*b*b/(self.root[n]*self.root[n]);}}
         let mut x = b.to_vec();
         let ap = self.apply(m, d, w, &x, dt, thermal);
         let mut r = b.to_vec();
@@ -402,6 +436,7 @@ impl Transport {
         }
         d.exchange_cached(w, &mut self.halo, nz, &mut self.exchange);
         let stresses = self.stresses(&self.halo, false);
+        let penalty_forces:Vec<V>=self.penalties.iter().map(|p|std::array::from_fn(|a|p.weight*self.mu[p.layer]*p.entries.iter().map(|&(n,b)|b*self.halo[n][a]).sum::<f64>())).collect();
         let mut mid = vec![[0.; 7]; u.len()];
         for &i in &d.owned {
             for k in 0..nz {
@@ -421,6 +456,10 @@ impl Transport {
                 de[q.index] += flux;
                 de[n] -= flux;
             }
+        }
+        for (p,force) in self.penalties.iter().zip(penalty_forces) {
+            let center=p.entries[0].0;
+            for &(n,b) in &p.entries {if n!=center{let vm=std::array::from_fn(|a|0.5*(mid[n][a]+mid[center][a]));let flux=dt*b*dot(force,vm);de[center]+=flux;de[n]-=flux;}}
         }
         let mut local = [0.; 3];
         for &i in &d.owned {

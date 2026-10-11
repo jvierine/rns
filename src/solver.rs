@@ -3,11 +3,15 @@ use std::collections::BTreeSet;
 pub struct Model {
     pub mesh: Mesh,
     pub background: Vec<Atmos>,
+    pub column_background: Option<Vec<Atmos>>,
     pub dz: f64, // Legacy nominal spacing; geometry uses vertical.
     pub vertical: crate::vertical::VerticalGrid,
     pub rotation: bool,
+    pub discrete_hydrostatic: bool,
+    pub conservative_gravity_energy: bool,
     pub sponge: bool,
     pub second_order: bool,
+    pub reconstruct_temperature: bool,
     pub reflect_top: bool,
     pub initial_sigma_m: f64,
     pub initial_surface_pressure_pa: f64,
@@ -20,14 +24,22 @@ struct Slopes {
 }
 /// Fixed topology and reusable stage buffers; rebuild when mesh/domain/grid changes.
 pub struct RhsWorkspace {
+    pub accelerator: Option<crate::compute::Accelerator>,
     columns: Vec<usize>,
     slopes: Vec<Option<Slopes>>,
     edges: Vec<usize>,
     cell_edges: Vec<[usize; 3]>,
     fluxes: Vec<Q>,
     result: Vec<Q>,
+    gravity_force: Vec<V>,
+    reference_vertical_correction: Vec<V>,
 }
 impl RhsWorkspace {
+    pub fn result(&self)->&[Q] {&self.result}
+    pub fn radial_gravity(&self,m:&Model,d:&Domain,slot:usize,k:usize)->f64 {
+        if m.discrete_hydrostatic {-dot(self.gravity_force[slot*m.background.len()+k],m.mesh.cells[d.owned[slot]].center)}else{m.background[k].g}
+    }
+
     pub fn new(m: &Model, d: &Domain) -> Self {
         let nz = m.background.len();
         let mut columns = d.owned.iter().copied().collect::<BTreeSet<_>>();
@@ -46,17 +58,34 @@ impl RhsWorkspace {
                     .map(|e| edges.binary_search(&e).unwrap())
             })
             .collect();
-        Self {
+        let mut gravity_force=vec![[0.;3];d.owned.len()*nz];
+        let reference_vertical_correction=vec![[0.;3];d.owned.len()*nz];
+        for (slot,&i) in d.owned.iter().enumerate() {let cell=&m.mesh.cells[i];for k in 0..nz {
+            let a=m.at(i,k);let lo=RE+m.vertical.faces[k];let hi=RE+m.vertical.faces[k+1];
+            let high=if k+1<nz {let ar=m.at(i,k+1);face_states(base(a),base(ar),a,ar,m.vertical.widths[k]/(m.vertical.widths[k]+m.vertical.widths[k+1])).2.p}else{a.p};
+            let low=if k>0 {let al=m.at(i,k-1);face_states(base(al),base(a),al,a,m.vertical.widths[k-1]/(m.vertical.widths[k-1]+m.vertical.widths[k])).2.p}else{a.p};
+            let mut gradient=mul(cell.vector_area,hi*hi*high-lo*lo*low);
+            for &eid in &cell.edges {let edge=&m.mesh.edges[eid];let sign=if edge.left==i {1.}else{-1.};gradient=add(gradient,mul(edge.outward,sign*0.5*(hi*hi-lo*lo)*edge.angle*a.p));}
+            gravity_force[slot*nz+k]=mul(gradient,1./(m.volume(i,k)*a.rho));
+
+        }}
+        let mut workspace=Self {
+            accelerator: None,
             columns: columns.into_iter().collect(),
             slopes: vec![None; d.needed.len() * nz],
             fluxes: vec![[0.; 7]; edges.len() * nz],
             edges,
             cell_edges,
             result: vec![[0.; 7]; d.needed.len() * nz],
-        }
+            gravity_force,
+            reference_vertical_correction,
+        };
+        if m.column_background.is_some(){let reference:Vec<Q>=d.needed.iter().flat_map(|&i|(0..nz).map(|k|base(m.at(i,k))).collect::<Vec<_>>()).collect();let rhs=m.rhs_cached(d,&reference,&mut workspace).to_vec();for(slot,&i)in d.owned.iter().enumerate(){let up=m.mesh.cells[i].center;for k in 0..nz{let q=rhs[d.index(i,k,nz)];workspace.reference_vertical_correction[slot*nz+k]=mul(up,-dot([q[1],q[2],q[3]],up));}}}
+        workspace
     }
 }
 impl Model {
+    pub fn at(&self,i:usize,k:usize)->Atmos{self.column_background.as_ref().map(|b|b[i*self.background.len()+k]).unwrap_or(self.background[k])}
     pub fn isothermal(level: usize, nz: usize, dz: f64) -> Self {
         let rt = 287. * 300.;
         let h = rt / 9.81;
@@ -74,12 +103,16 @@ impl Model {
                     }
                 })
                 .collect(),
+            column_background: None,
             dz,
             vertical: crate::vertical::VerticalGrid::uniform(nz, dz),
             rotation: false,
+            discrete_hydrostatic: false,
+            conservative_gravity_energy: false,
             reflect_top: false,
             sponge: false,
             second_order: true,
+            reconstruct_temperature: false,
             initial_sigma_m: 1_000_000.,
             initial_surface_pressure_pa: 1e-7 * 287. * 300.,
             heat_pulse: false,
@@ -99,7 +132,7 @@ impl Model {
         for &i in &d.needed {
             let dist = angle(self.mesh.cells[i].center, source) * RE;
             for k in 0..nz {
-                let a = self.background[k];
+                let a = self.at(i,k);
                 let mut q = base(a);
                 if lamb {
                     let z = self.vertical.centers[k];
@@ -148,6 +181,9 @@ impl Model {
     pub fn rhs_cached<'a>(&self, d: &Domain, u: &[Q], work: &'a mut RhsWorkspace) -> &'a mut [Q] {
         self.rhs_impl(d, u, work, true)
     }
+    fn reconstruction_state(&self,q:Q,a:Atmos)->Q {
+        let mut p=primitive(q,a);if self.reconstruct_temperature {p[4]/=p[0];}p
+    }
     fn rhs_impl<'a>(
         &self,
         d: &Domain,
@@ -157,9 +193,23 @@ impl Model {
     ) -> &'a mut [Q] {
         let nz = self.background.len();
         assert_eq!(u.len(), work.result.len());
+        let mut gpu_vertical = None;
+        if cached && work.accelerator.is_some() {
+            let attempt=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||work.accelerator.as_mut().unwrap().model_fluxes(self,d,u,&work.columns,&work.edges)));
+            match attempt {
+                Ok(Ok(mut fluxes)) => {
+                    let vertical=fluxes.split_off(work.fluxes.len());
+                    work.fluxes.copy_from_slice(&fluxes);gpu_vertical=Some(vertical);
+                }
+                other => {
+                    eprintln!("GPU execution failed ({:?}); switching this rank to CPU",other.map(|r|r.err()));
+                    work.accelerator=None;
+                }
+            }
+        }
         let columns = &work.columns;
         let slopes = &mut work.slopes;
-        if self.second_order {
+        if self.second_order && (gpu_vertical.is_none()) {
             for &i in columns {
                 let up = self.mesh.cells[i].center;
                 let axis = if up[2].abs() < 0.9 {
@@ -171,7 +221,7 @@ impl Model {
                 let n = cross(up, e);
                 for k in 0..nz {
                     let radius = RE + self.vertical.centers[k];
-                    let p = primitive(u[d.index(i, k, nz)], self.background[k]);
+                    let p = self.reconstruction_state(u[d.index(i, k, nz)], self.background[k]);
                     let mut a = 0.;
                     let mut b = 0.;
                     let mut c = 0.;
@@ -187,7 +237,7 @@ impl Model {
                         a += weight * x * x;
                         b += weight * x * y;
                         c += weight * y * y;
-                        let neighbor = primitive(u[d.index(j, k, nz)], self.background[k]);
+                        let neighbor = self.reconstruction_state(u[d.index(j, k, nz)], self.background[k]);
                         for f in 0..7 {
                             bx[f] += weight * x * (neighbor[f] - p[f]);
                             by[f] += weight * y * (neighbor[f] - p[f]);
@@ -214,9 +264,10 @@ impl Model {
                         }
                         horizontal[f] = mul(horizontal[f], theta.clamp(0., 1.));
                     }
+                    let p = self.reconstruction_state(u[d.index(i,k,nz)],self.at(i,k));
                     let vertical = if k > 0 && k + 1 < nz {
-                        let below = primitive(u[d.index(i, k - 1, nz)], self.background[k - 1]);
-                        let above = primitive(u[d.index(i, k + 1, nz)], self.background[k + 1]);
+                        let below = self.reconstruction_state(u[d.index(i, k - 1, nz)], self.at(i,k-1));
+                        let above = self.reconstruction_state(u[d.index(i, k + 1, nz)], self.at(i,k+1));
                         std::array::from_fn(|f| {
                             let dl = self.vertical.centers[k] - self.vertical.centers[k - 1];
                             let dr = self.vertical.centers[k + 1] - self.vertical.centers[k];
@@ -247,24 +298,26 @@ impl Model {
         }
         let reconstruct = |i: usize, k: usize, delta: V, vertical: f64| {
             let q = u[d.index(i, k, nz)];
-            if !self.second_order || q == base(self.background[k]) {
+            let background=if vertical==0. {self.background[k]}else{self.at(i,k)};
+            if !self.second_order || q == base(background) {
                 return q;
             }
-            let p = primitive(q, self.background[k]);
+            let p = self.reconstruction_state(q, background);
             let slope = slopes[d.index(i, k, nz)]
                 .as_ref()
                 .expect("Missing face slope");
-            let face = std::array::from_fn(|f| {
+            let mut face:Q = std::array::from_fn(|f| {
                 p[f] + dot(slope.horizontal[f], delta) + vertical * slope.vertical[f]
             });
-            let trial = conserved(face, self.background[k]);
-            if admissible(trial, self.background[k]) {
+            if self.reconstruct_temperature {face[4]*=face[0];}
+            let trial = conserved(face, background);
+            if admissible(trial, background) {
                 trial
             } else {
                 q
             }
         };
-        if cached {
+        if cached && gpu_vertical.is_none() {
             for (slot, &eid) in work.edges.iter().enumerate() {
                 let edge = &self.mesh.edges[eid];
                 for k in 0..nz {
@@ -292,7 +345,7 @@ impl Model {
             let cell = &self.mesh.cells[i];
             let up = cell.center;
             for k in 0..nz {
-                let a = self.background[k];
+                let a = self.at(i,k);
                 let q = u[d.index(i, k, nz)];
                 let lo = RE + self.vertical.faces[k];
                 let hi = RE + self.vertical.faces[k + 1];
@@ -313,7 +366,7 @@ impl Model {
                     } else {
                         let left = reconstruct(edge.left, k, delta, 0.);
                         let right = reconstruct(edge.right, k, mul(delta, -1.), 0.);
-                        hll(left, right, a, a, edge.outward)
+                        hll(left, right, self.background[k], self.background[k], edge.outward)
                     };
                     let area = 0.5 * (hi * hi - lo * lo) * edge.angle;
                     let sign = if edge.left == i { 1. } else { -1. };
@@ -323,9 +376,12 @@ impl Model {
                 }
                 let normal = unit(cell.vector_area);
                 let va = norm(cell.vector_area);
+                let (top,bottom)=if let Some(v)=&gpu_vertical {
+                    (v[(owned_slot*nz+k)*2],v[(owned_slot*nz+k)*2+1])
+                } else {
                 let high = reconstruct(i, k, [0.; 3], 0.5);
                 let (right, ar) = if k + 1 < nz {
-                    (reconstruct(i, k + 1, [0.; 3], -0.5), self.background[k + 1])
+                    (reconstruct(i, k + 1, [0.; 3], -0.5), self.at(i,k+1))
                 } else if self.reflect_top {
                     let mut mirror = high;
                     let radial = dot([high[1], high[2], high[3]], normal);
@@ -345,7 +401,7 @@ impl Model {
                 let top = hll_at(high, right, a, ar, normal, top_fraction);
                 let low = reconstruct(i, k, [0.; 3], -0.5);
                 let (left, al) = if k > 0 {
-                    (reconstruct(i, k - 1, [0.; 3], 0.5), self.background[k - 1])
+                    (reconstruct(i, k - 1, [0.; 3], 0.5), self.at(i,k-1))
                 } else {
                     let mut mirror = low;
                     let radial = dot([low[1], low[2], low[3]], normal);
@@ -361,13 +417,21 @@ impl Model {
                     0.5
                 };
                 let bottom = hll_at(left, low, al, a, normal, bottom_fraction);
+                    (top,bottom)
+                };
                 for f in 0..7 {
                     rate[f] -= va * (hi * hi * top[f] - lo * lo * bottom[f]) / volume;
                 }
-                for t in 0..3 {
-                    rate[t + 1] -= (q[0] - a.rho) * a.g * up[t];
-                }
-                rate[4] -= dot([q[1], q[2], q[3]], up) * a.g;
+                let gravity=if self.discrete_hydrostatic {work.gravity_force[owned_slot*nz+k]}else{mul(up,-a.g)};
+                for t in 0..3 {rate[t+1]+=(q[0]-a.rho)*gravity[t]+work.reference_vertical_correction[owned_slot*nz+k][t];}
+                if self.conservative_gravity_energy {
+                    // Use the SAME face mass flux for gas/potential-energy exchange.
+                    // This telescopes globally for a stationary radial potential.
+                    let phi=|z:f64| self.background[0].g*RE*RE*(1./RE-1./(RE+z));
+                    let center=phi(self.vertical.centers[k]);
+                    rate[4]+=va*(hi*hi*top[0]*(center-phi(self.vertical.faces[k+1]))
+                        -lo*lo*bottom[0]*(center-phi(self.vertical.faces[k])))/volume;
+                } else {rate[4]+=dot([q[1],q[2],q[3]],gravity);}
                 if self.rotation {
                     let coriolis = mul(cross([0., 0., 7.292115e-5], [q[1], q[2], q[3]]), -2.);
                     for t in 0..3 {
@@ -396,7 +460,7 @@ impl Model {
         for &i in &d.owned {
             for k in 0..nz {
                 let q = u[d.index(i, k, nz)];
-                let c = thermo(q, self.background[k]).1;
+                let c = thermo(q, self.at(i,k)).1;
                 let speed = norm([q[1], q[2], q[3]]) / q[0];
                 let lo = RE + self.vertical.faces[k];
                 let hi = RE + self.vertical.faces[k + 1];

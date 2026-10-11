@@ -12,3 +12,8 @@ num-complex = "0.4"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[features]
+default = ["native-metal"]
+
+native-metal = []

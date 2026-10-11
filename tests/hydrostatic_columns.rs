@@ -1,0 +1,13 @@
+use global_neutral_euler::{era5::Era5,parallel::Domain,solver::{Model,RhsWorkspace},physics::*,mesh::*,compute::{Accelerator,Precision}};
+#[test]
+fn columns_balance_vertical_force_and_retain_horizontal_weather_gradient(){
+ let e=Era5::load("data/era5_20250306_23utc.h5").unwrap();let mut m=Model::isothermal(2,30,2000.);m.discrete_hydrostatic=true;m.reconstruct_temperature=true;m.column_background=Some(e.hydrostatic_columns(&m));let d=Domain::new(&m.mesh,0,1);let u=e.initialize_hydrostatic_columns(&m,&d,false);let mut cpu=RhsWorkspace::new(&m,&d);let rhs=m.rhs_cached(&d,&u,&mut cpu).to_vec();let mut radial=0f64;let mut horizontal=0f64;
+ for &i in &d.owned{for k in 0..30{let n=d.index(i,k,30);let a=m.at(i,k);assert_eq!(u[n],base(a));let force=[rhs[n][1],rhs[n][2],rhs[n][3]];let up=m.mesh.cells[i].center;radial=radial.max(dot(force,up).abs()/a.rho);horizontal=horizontal.max(norm(force)/a.rho);assert!(rhs[n].iter().all(|x|x.is_finite()));if k>0{let previous=m.at(i,k-1);let t=temperature(base(a),a);let tp=temperature(base(previous),previous);let expected=-0.5*(a.g/(a.r*t)+previous.g/(previous.r*tp))*2000.;assert!(((a.p/previous.p).ln()-expected).abs()<1e-14);}}}
+ assert!(radial<1e-12,"radial acceleration {radial}");assert!(horizontal>1e-5,"weather pressure gradient was lost");
+ let accelerator=Accelerator::discover("metal",Precision::F32,0).unwrap();if std::env::var_os("RNS_REQUIRE_GPU").is_some(){assert!(accelerator.is_some());}if let Some(a)=accelerator{let mut gpu=RhsWorkspace::new(&m,&d);gpu.accelerator=Some(a);let actual=m.rhs_cached(&d,&u,&mut gpu).to_vec();assert!(gpu.accelerator.is_some());let error=actual.iter().zip(&rhs).map(|(a,b)|(0..7).map(|j|(a[j]-b[j]).powi(2)).sum::<f64>()).sum::<f64>().sqrt()/rhs.iter().flatten().map(|x|x*x).sum::<f64>().sqrt();assert!(error<5e-5,"GPU RHS error {error}");}
+ eprintln!("Hydrostatic columns radial residual {radial} m/s2; horizontal acceleration {horizontal}");
+ let f=hdf5::File::create("data/era5_hydrostatic_columns_operator_validation.h5").unwrap();f.new_attr::<f64>().create("radial_acceleration_max_m_s2").unwrap().write_scalar(&radial).unwrap();f.new_attr::<f64>().create("horizontal_acceleration_max_m_s2").unwrap().write_scalar(&horizontal).unwrap();
+}
+
+#[test]
+fn upper_columns_share_pressure_and_density_after_hydrostatic_join(){let e=Era5::load("data/era5_20250306_23utc.h5").unwrap();let mut m=Model::isothermal(1,70,2000.);m.column_background=Some(e.hydrostatic_columns(&m));for i in 1..m.mesh.cells.len(){for k in 60..70{assert!((m.at(i,k).p/m.at(0,k).p-1.).abs()<1e-13);assert!((m.at(i,k).rho/m.at(0,k).rho-1.).abs()<1e-13);}}}
