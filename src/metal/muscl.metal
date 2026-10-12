@@ -9,17 +9,19 @@ kernel void slopes(device const float*p [[buffer(0)]],device const uint*topo [[b
  float theta=1;
  for(uint j=0;j<3;j++){float change=dot(grad,float3(g[col*18+9+j*3],g[col*18+10+j*3],g[col*18+11+j*3]));if(change>0)theta=min(theta,(hi-center)/change);if(change<0)theta=min(theta,(lo-center)/change);}
  grad*=clamp(theta,0.f,1.f);for(uint a=0;a<3;a++)out[cell*28+f*4+a]=grad[a];
- if(k>0 && k+1<nz){float dl=z[k*3],dr=z[k*3+1],w=z[k*3+2];float vertical_center=p[cell*18+9+f];float l=(vertical_center-p[(cell-1)*18+9+f])/dl,r=(p[(cell+1)*18+9+f]-vertical_center)/dr;
+ if(k>0 && k+1<nz){float dl=z[k*3],dr=z[k*3+1],w=z[k*3+2];float vertical_center=p[cell*18+9+f];float below=p[(cell-1)*18+9+f],above=p[(cell+1)*18+9+f];
+ if(f==4){bool thermal=(uint(p[cell*18+16])&2)!=0;uint nb[2]={cell-1,cell+1};float v[2]={below,above};for(uint j=0;j<2;j++){if(((uint(p[nb[j]*18+16])&2)!=0)!=thermal){float dp=p[nb[j]*18+17],dr=p[nb[j]*18+9];v[j]=thermal?(dp-dr)/(1+dr):dp;}}below=v[0];above=v[1];}
+ float l=(vertical_center-below)/dl,r=(above-vertical_center)/dr;
  if(l*r>0)out[cell*28+f*4+3]=(l>0?1.f:-1.f)*min(2*abs(l),min(2*abs(r),abs((dl*l+dr*r)/(dl+dr))))*w;}
 }
 kernel void faces(device const float*p [[buffer(0)]],device const float*s [[buffer(1)]],device const uint*ids [[buffer(2)]],device const float*g [[buffer(3)]],device float*out [[buffer(4)]],constant uint&count [[buffer(5)]],uint face [[thread_position_in_grid]]) {
  if(face>=count)return;uint b=face*18,o=face*24;float3 n=float3(g[b],g[b+1],g[b+2]);
  for(uint side=0;side<2;side++){uint cell=ids[face*5+side];uint shift=ids[face*5+4]?9:0;float v[7];float norm=0;
  for(uint f=0;f<7;f++){v[f]=cell==UINT_MAX?0:p[cell*18+shift+f];norm+=abs(v[f]);}
- if(cell!=UINT_MAX && p[cell*18+shift+7]==0 && g[b+17]>0){
+ if(cell!=UINT_MAX && (uint(p[cell*18+shift+7])&1)==0 && g[b+17]>0){
  for(uint f=0;f<7;f++){uint j=cell*28+f*4;v[f]+=s[j]*g[b+3+side*3]+s[j+1]*g[b+4+side*3]+s[j+2]*g[b+5+side*3]+s[j+3]*g[b+9+side];}
  if(v[0]<=-1 || v[4]<=-1 || v[5]<0 || v[6]<0 || v[5]+v[6]>=1)for(uint f=0;f<7;f++)v[f]=p[cell*18+shift+f];}
- if(g[b+17]>1.5 && cell!=UINT_MAX){
+ if(cell!=UINT_MAX && (uint(p[cell*18+shift+7])&2)!=0){
  // Retain the f64-packed centre pressure perturbation. Recomputing it as
  // (1+dT)*(1+drho)-1 loses weak pressure signals through f32 cancellation.
  float dr=v[0]-p[cell*18+shift],dt=v[4]-p[cell*18+shift+4];
@@ -55,6 +57,9 @@ kernel void hlle(device const float *a [[buffer(0)]],device float *out [[buffer(
  if(f==0){fl=rl*ul;fr=rr*ur;}
  if(f>0 && f<4){fl+=pl*a[b+13+f]/gamma;fr+=pr*a[b+13+f]/gamma;}
  if(f==4){fl=(1+a[b+4]+gm*(1+pl))*ul;fr=(1+a[b+11]+gm*(1+pr))*ur;}
- out[i*7+f]=(sr*fl-sl*fr+sl*sr*(a[b+7+f]-a[b+f]))/(sr-sl);
+ // Equivalent HLLE tracer flux, with nonnegative one-sided coefficients.
+ // Avoid cancellation between diffusion and advection at a zero-species front.
+ if(f>=5)out[i*7+f]=(sr*(ul-sl)*a[b+f]+sl*(sr-ur)*a[b+7+f])/(sr-sl);
+ else out[i*7+f]=(sr*fl-sl*fr+sl*sr*(a[b+7+f]-a[b+f]))/(sr-sl);
  }
 }

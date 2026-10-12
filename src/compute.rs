@@ -58,11 +58,11 @@ impl Accelerator {
         }
         Ok(None)
     }
-    pub fn model_fluxes(&mut self,m:&crate::solver::Model,d:&crate::parallel::Domain,u:&[Q],columns:&[usize],edges:&[usize])->Result<Vec<Q>> {
+    pub fn model_fluxes_into(&mut self,m:&crate::solver::Model,d:&crate::parallel::Domain,u:&[Q],columns:&[usize],edges:&[usize],horizontal:&mut[Q],vertical:&mut Vec<Q>)->Result<()> {
         #[cfg(all(feature="native-metal",target_os="macos"))]
-        {return self.native.model_fluxes(m,d,u,columns,edges);}
+        {return self.native.model_fluxes_into(m,d,u,columns,edges,horizontal,vertical);}
         #[cfg(not(all(feature="native-metal",target_os="macos")))]
-        {let _=(m,d,u,columns,edges);anyhow::bail!("Metal disabled")}
+        {let _=(m,d,u,columns,edges,horizontal,vertical);anyhow::bail!("Metal disabled")}
     }
     pub fn fluxes(&self,faces:&[Face])->Result<Vec<Q>> {
         #[cfg(all(feature="native-metal",target_os="macos"))]

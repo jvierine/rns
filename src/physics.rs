@@ -57,11 +57,13 @@ pub fn conserved(p: Q, a: Atmos) -> Q {
     q[4] = p[4] * a.p * cv / gas + 0.5 * rho * (p[1] * p[1] + p[2] * p[2] + p[3] * p[3]);
     q
 }
-pub fn admissible(q: Q, a: Atmos) -> bool {
+pub fn admissible(q: Q, a: Atmos) -> bool {admissible_with_tracer_roundoff(q,a,0.)}
+/// Permit only explicitly bounded tracer roundoff; never modifies the state.
+pub fn admissible_with_tracer_roundoff(q:Q,a:Atmos,tolerance:f64)->bool {
     q.iter().all(|x| x.is_finite())
         && q[0] > 0.
-        && q[5] >= 0.
-        && q[6] >= 0.
+        && q[5] >= -tolerance*q[0]
+        && q[6] >= -tolerance*q[0]
         && q[5] + q[6] < q[0]
         && thermo(q, a).0 > 0.
 }
@@ -194,4 +196,16 @@ mod tests {
         assert_eq!(s[4], 28_880_000.);
         assert!((s[5] + s[6] - s[0]).abs() < 1e-15);
     }
+}
+
+#[cfg(test)]
+mod tracer_roundoff_tests {
+ use super::*;
+ #[test]fn roundoff_gate_preserves_state_and_rejects_resolved_negative_mass(){
+  let a=Atmos{rho:1e-11,p:1e-11*287.*800.,r:287.,cv:717.5,g:9.};
+  let mut q=base(a);q[6]=-2e-52;let before=q;
+  assert!(!admissible(q,a));assert!(admissible_with_tracer_roundoff(q,a,32.*f64::EPSILON));assert_eq!(q,before);
+  q[6]=-1e-20;assert!(!admissible_with_tracer_roundoff(q,a,32.*f64::EPSILON));
+  q=base(a);q[4]=-1.;assert!(!admissible_with_tracer_roundoff(q,a,32.*f64::EPSILON));
+ }
 }

@@ -8,10 +8,12 @@ pub struct Model {
     pub vertical: crate::vertical::VerticalGrid,
     pub rotation: bool,
     pub discrete_hydrostatic: bool,
+    pub tracer_roundoff_fraction:f64,
     pub conservative_gravity_energy: bool,
     pub sponge: bool,
     pub second_order: bool,
     pub reconstruct_temperature: bool,
+    pub thermal_reconstruction_start_m: f64,
     pub reflect_top: bool,
     pub initial_sigma_m: f64,
     pub initial_surface_pressure_pa: f64,
@@ -30,6 +32,7 @@ pub struct RhsWorkspace {
     edges: Vec<usize>,
     cell_edges: Vec<[usize; 3]>,
     fluxes: Vec<Q>,
+    gpu_vertical_fluxes:Vec<Q>,
     result: Vec<Q>,
     gravity_force: Vec<V>,
     reference_vertical_correction: Vec<V>,
@@ -74,6 +77,7 @@ impl RhsWorkspace {
             columns: columns.into_iter().collect(),
             slopes: vec![None; d.needed.len() * nz],
             fluxes: vec![[0.; 7]; edges.len() * nz],
+            gpu_vertical_fluxes:vec![],
             edges,
             cell_edges,
             result: vec![[0.; 7]; d.needed.len() * nz],
@@ -108,11 +112,13 @@ impl Model {
             vertical: crate::vertical::VerticalGrid::uniform(nz, dz),
             rotation: false,
             discrete_hydrostatic: false,
+            tracer_roundoff_fraction:0.,
             conservative_gravity_energy: false,
             reflect_top: false,
             sponge: false,
             second_order: true,
             reconstruct_temperature: false,
+            thermal_reconstruction_start_m: f64::INFINITY,
             initial_sigma_m: 1_000_000.,
             initial_surface_pressure_pa: 1e-7 * 287. * 300.,
             heat_pulse: false,
@@ -181,8 +187,9 @@ impl Model {
     pub fn rhs_cached<'a>(&self, d: &Domain, u: &[Q], work: &'a mut RhsWorkspace) -> &'a mut [Q] {
         self.rhs_impl(d, u, work, true)
     }
-    fn reconstruction_state(&self,q:Q,a:Atmos)->Q {
-        let mut p=primitive(q,a);if self.reconstruct_temperature {p[4]/=p[0];}p
+    pub fn temperature_at(&self,k:usize)->bool {self.reconstruct_temperature || self.vertical.centers[k]>=self.thermal_reconstruction_start_m}
+    fn reconstruction_state(&self,q:Q,a:Atmos,k:usize)->Q {
+        let mut p=primitive(q,a);if self.temperature_at(k) {p[4]/=p[0];}p
     }
     fn rhs_impl<'a>(
         &self,
@@ -193,20 +200,15 @@ impl Model {
     ) -> &'a mut [Q] {
         let nz = self.background.len();
         assert_eq!(u.len(), work.result.len());
-        let mut gpu_vertical = None;
+        let mut gpu_valid=false;
         if cached && work.accelerator.is_some() {
-            let attempt=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||work.accelerator.as_mut().unwrap().model_fluxes(self,d,u,&work.columns,&work.edges)));
+            let attempt=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||work.accelerator.as_mut().unwrap().model_fluxes_into(self,d,u,&work.columns,&work.edges,&mut work.fluxes,&mut work.gpu_vertical_fluxes)));
             match attempt {
-                Ok(Ok(mut fluxes)) => {
-                    let vertical=fluxes.split_off(work.fluxes.len());
-                    work.fluxes.copy_from_slice(&fluxes);gpu_vertical=Some(vertical);
-                }
-                other => {
-                    eprintln!("GPU execution failed ({:?}); switching this rank to CPU",other.map(|r|r.err()));
-                    work.accelerator=None;
-                }
+                Ok(Ok(()))=>{gpu_valid=true;}
+                other=>{eprintln!("GPU execution failed ({:?}); switching this rank to CPU",other.map(|r|r.err()));work.accelerator=None;}
             }
         }
+        let gpu_vertical=if gpu_valid{Some(work.gpu_vertical_fluxes.as_slice())}else{None};
         let columns = &work.columns;
         let slopes = &mut work.slopes;
         if self.second_order && (gpu_vertical.is_none()) {
@@ -221,7 +223,7 @@ impl Model {
                 let n = cross(up, e);
                 for k in 0..nz {
                     let radius = RE + self.vertical.centers[k];
-                    let p = self.reconstruction_state(u[d.index(i, k, nz)], self.background[k]);
+                    let p = self.reconstruction_state(u[d.index(i, k, nz)], self.background[k],k);
                     let mut a = 0.;
                     let mut b = 0.;
                     let mut c = 0.;
@@ -237,7 +239,7 @@ impl Model {
                         a += weight * x * x;
                         b += weight * x * y;
                         c += weight * y * y;
-                        let neighbor = self.reconstruction_state(u[d.index(j, k, nz)], self.background[k]);
+                        let neighbor = self.reconstruction_state(u[d.index(j, k, nz)], self.background[k],k);
                         for f in 0..7 {
                             bx[f] += weight * x * (neighbor[f] - p[f]);
                             by[f] += weight * y * (neighbor[f] - p[f]);
@@ -264,10 +266,10 @@ impl Model {
                         }
                         horizontal[f] = mul(horizontal[f], theta.clamp(0., 1.));
                     }
-                    let p = self.reconstruction_state(u[d.index(i,k,nz)],self.at(i,k));
+                    let p = self.reconstruction_state(u[d.index(i,k,nz)],self.at(i,k),k);
                     let vertical = if k > 0 && k + 1 < nz {
-                        let below = self.reconstruction_state(u[d.index(i, k - 1, nz)], self.at(i,k-1));
-                        let above = self.reconstruction_state(u[d.index(i, k + 1, nz)], self.at(i,k+1));
+                        let below = self.reconstruction_state(u[d.index(i, k - 1, nz)], self.at(i,k-1),k);
+                        let above = self.reconstruction_state(u[d.index(i, k + 1, nz)], self.at(i,k+1),k);
                         std::array::from_fn(|f| {
                             let dl = self.vertical.centers[k] - self.vertical.centers[k - 1];
                             let dr = self.vertical.centers[k + 1] - self.vertical.centers[k];
@@ -302,14 +304,14 @@ impl Model {
             if !self.second_order || q == base(background) {
                 return q;
             }
-            let p = self.reconstruction_state(q, background);
+            let p = self.reconstruction_state(q, background,k);
             let slope = slopes[d.index(i, k, nz)]
                 .as_ref()
                 .expect("Missing face slope");
             let mut face:Q = std::array::from_fn(|f| {
                 p[f] + dot(slope.horizontal[f], delta) + vertical * slope.vertical[f]
             });
-            if self.reconstruct_temperature {face[4]*=face[0];}
+            if self.temperature_at(k) {face[4]*=face[0];}
             let trial = conserved(face, background);
             if admissible(trial, background) {
                 trial
@@ -377,7 +379,7 @@ impl Model {
                 let normal = unit(cell.vector_area);
                 let va = norm(cell.vector_area);
                 let (top,bottom)=if let Some(v)=&gpu_vertical {
-                    (v[(owned_slot*nz+k)*2],v[(owned_slot*nz+k)*2+1])
+                    (v[owned_slot*(nz+1)+k+1],v[owned_slot*(nz+1)+k])
                 } else {
                 let high = reconstruct(i, k, [0.; 3], 0.5);
                 let (right, ar) = if k + 1 < nz {
